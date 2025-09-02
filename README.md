@@ -1,13 +1,22 @@
-# Adversarially-Robust Federated Learning for Multi-Institutional EHR
 
-Authors: Saswati Chatterjee, Suneeta Satpathy
+# Adversarial Robust Federated Learning for Secure Mortality Risk Prediction (AR-FL-EHR)
+
+Official starter implementation scaffolding for the paper:
+
+**Adversarial Robust Federated Learning for Secure Mortality Risk Prediction Using Multi-Institutional EHR**  
+*Authors: Saswati Chatterjee, Suneeta Satpathy*
 
 ## Overview
-Implementation of AR-FL: adversarially-robust federated learning for mortality risk prediction using multi-institutional EHR data.
+This scaffold includes a modular structure for:
+- Federated learning (FedAvg) with adversarial training (FGSM/PGD)
+- Domain-aware attention for cross-institutional generalization
+- Differential privacy hooks and (placeholder) secure aggregation
+- Evaluation & visualization utilities
 
-## Installation
+> NOTE: Real EHR datasets are not included. Use links to MIMIC-III / eICU in the README of your final repo and run preprocessing accordingly.
+
+## Quickstart
 ```bash
-git clone https://github.com/Saswati-C/AR-FL-EHR.git
-cd AR-FL-EHR
 pip install -r requirements.txt
-# AR-FL-EHR
+python training/train.py --config experiments/configs/arfl_config.json
+```
