@@ -1,86 +1,103 @@
-
-"""Main training loop for AR-FL-EHR.
-
-This is a *minimal* scaffold that simulates clients with random tensors so you can
-verify end-to-end flow before wiring real EHR loaders.
-
-Usage:
-    python training/train.py --config experiments/configs/arfl_config.json
-"""
-import os, json, argparse, random
+import os
+import json
 import torch
-import torch.nn.functional as F
-
+import torch.nn as nn
+import torch.optim as optim
+from federated.client import load_client_data
+from federated.server import federated_averaging
 from model.ar_fl_model import ARFLModel
-from federated.client import Client
-from federated.server import Server
-from privacy.dp_utils import clip_and_add_noise
-from privacy.secure_aggregation import secure_aggregate
+from federated.adversarial_training import fgsm_attack
+from privacy.dp_utils import add_dp_to_optimizer
 
-def load_config(path: str) -> dict:
-    with open(path, 'r') as f:
+
+# --------------------------
+# Load Config
+# --------------------------
+def load_config(config_path):
+    with open(config_path, "r") as f:
         return json.load(f)
 
-def make_synthetic_clients(cfg: dict):
-    num_clients = cfg.get('num_clients', 3)
-    input_dim = cfg.get('input_dim', 256)
-    num_classes = cfg.get('num_classes', 2)
-    per_client = True
 
-    clients = []
-    for cid in range(num_clients):
-        X = torch.rand(512, input_dim)
-        y = torch.randint(0, num_classes, (512,))
-        model = ARFLModel(in_features=input_dim, num_classes=num_classes, use_attention=True,
-                          per_client=per_client, num_clients=num_clients)
-        clients.append(Client(cid, model, X, y, batch_size=cfg['batch_size']))
-    return clients
+# --------------------------
+# Local Training (per client)
+# --------------------------
+def local_train(model, dataloader, criterion, optimizer, device, epsilon, lambda_adv):
+    model.train()
+    for X, y in dataloader:
+        X, y = X.to(device), y.to(device)
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--config', required=True, help='Path to JSON config')
-    args = ap.parse_args()
+        # Forward on clean data
+        optimizer.zero_grad()
+        outputs = model(X)
+        loss_clean = criterion(outputs, y)
 
-    cfg = load_config(args.config)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # Generate adversarial examples (FGSM)
+        X_adv = fgsm_attack(model, X, y, epsilon, criterion)
+        outputs_adv = model(X_adv)
+        loss_adv = criterion(outputs_adv, y)
 
-    # Build clients and a server with a global model of same shape
-    clients = make_synthetic_clients(cfg)
-    global_model = ARFLModel(cfg['input_dim'], cfg['num_classes'], use_attention=True,
-                             per_client=True, num_clients=cfg['num_clients'])
-    server = Server(global_model, device=device)
+        # Mix losses
+        loss = (1 - lambda_adv) * loss_clean + lambda_adv * loss_adv
+        loss.backward()
+        optimizer.step()
 
-    rounds = cfg['rounds']
-    for r in range(1, rounds+1):
+    return model.state_dict()
+
+
+# --------------------------
+# Federated Training
+# --------------------------
+def federated_training(config):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Load config
+    input_dim = config["model"]["input_dim"]
+    hidden_dims = config["model"]["hidden_dims"]
+    num_classes = config["model"]["num_classes"]
+    rounds = config["federated"]["rounds"]
+    clients = config["federated"]["clients"]
+    lr = config["training"]["lr"]
+    epsilon = config["adversarial"]["epsilon"]
+    lambda_adv = config["adversarial"]["lambda"]
+
+    # Create global model
+    global_model = ARFLModel(input_dim, hidden_dims, num_classes).to(device)
+
+    # Load client data
+    client_files = [f"data/client_{i+1}.csv" for i in range(clients)]
+    client_loaders = [load_client_data(fp, batch_size=32) for fp in client_files]
+
+    for r in range(rounds):
+        print(f"\n--- Global Round {r+1} ---")
+
         client_states = []
-        for client in clients:
-            # load latest global weights
-            client.model.load_state_dict(server.global_model.state_dict())
-            sd = client.local_train(
-                epochs=cfg['epochs'],
-                lr=cfg['learning_rate'],
-                epsilon=cfg['epsilon'],
-                pgd_steps=cfg['pgd_steps'],
-                step_size=cfg['step_size'],
-                lambda_adv=cfg['lambda_adv'],
-            )
-            client_states.append(sd)
+        for i, loader in enumerate(client_loaders):
+            print(f"Training client {i+1} ...")
 
-        # optional DP + secure aggregation
-        client_states = clip_and_add_noise(client_states, clip_norm=cfg['clip_norm'], noise_multiplier=cfg['dp_noise'])
-        client_states = secure_aggregate(client_states)
+            local_model = ARFLModel(input_dim, hidden_dims, num_classes).to(device)
+            local_model.load_state_dict(global_model.state_dict())  # start from global
 
-        server.aggregate(client_states)
-        print(f"[Round {r}/{rounds}] Aggregated global model.")
+            criterion = nn.CrossEntropyLoss()
+            optimizer = optim.Adam(local_model.parameters(), lr=lr)
 
-    # quick sanity check on random data
-    Xtest = torch.rand(1024, cfg['input_dim'])
-    ytest = torch.randint(0, cfg['num_classes'], (1024,))
-    server.global_model.eval()
-    with torch.no_grad():
-        logits, _ = server.global_model(Xtest)
-        acc = (logits.argmax(1) == ytest).float().mean().item()
-        print(f"Synthetic test accuracy (not meaningful): {acc:.3f}")
+            # Add DP if enabled
+            if config["privacy"]["use_dp"]:
+                optimizer = add_dp_to_optimizer(optimizer, noise_multiplier=1.0, max_grad_norm=1.0)
 
-if __name__ == '__main__':
-    main()
+            state_dict = local_train(local_model, loader, criterion, optimizer, device, epsilon, lambda_adv)
+            client_states.append(state_dict)
+
+        # Aggregate weights (FedAvg)
+        global_model.load_state_dict(federated_averaging(client_states))
+
+    torch.save(global_model.state_dict(), "global_model.pth")
+    print("✅ Training complete. Model saved as global_model.pth")
+
+
+# --------------------------
+# Main
+# --------------------------
+if __name__ == "__main__":
+    config_path = "experiments/configs/arfl_config.json"
+    config = load_config(config_path)
+    federated_training(config)
